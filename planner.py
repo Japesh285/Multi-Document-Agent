@@ -1,27 +1,33 @@
 """
 planner.py — Query planning phase.
 
-Decomposes a natural-language request into 3-8 specific, executable
-steps grounded in the real schema.
+Decomposes a natural-language request into 2-8 concrete, executable steps
+grounded in the live workspace. Each step carries:
+  - id, description
+  - tool: "python" | "web_search" | "chart"
+  - targets: list of workspace object names the step will touch
 
-Each step now carries an optional `tool` field:
-  "pandas"      — generate & execute pandas code (default)
-  "web_search"  — call mcp_tools.search_web()
-  "chart"       — explicitly request a chart (handled by analyzer)
+Cross-document operations naturally appear as steps whose `targets` span
+multiple objects (e.g. ["crm", "contract__table_1"]).
 """
 
 from __future__ import annotations
 import json
 import re
+from typing import TYPE_CHECKING
 
-from schema import SchemaInfo
-from llm    import call_chat
-from utils  import get_logger
+from llm   import call_chat
+from utils import get_logger
+
+if TYPE_CHECKING:
+    from core import Workspace
 
 log = get_logger("planner")
 
 MAX_STEPS = 8
 MIN_STEPS = 2
+
+_VALID_TOOLS = {"python", "pandas", "web_search", "chart"}
 
 
 # ---------------------------------------------------------------------------
@@ -29,86 +35,74 @@ MIN_STEPS = 2
 # ---------------------------------------------------------------------------
 
 _SYSTEM = """\
-You are a data analysis planner for sports betting data.
-Decompose the user's request into specific, concrete steps
-that can be executed as pandas code or web searches.\
+You are a planner for a programmable workspace where multiple spreadsheets,
+documents, and tables coexist as live Python objects. Break user requests
+into specific, executable steps that orchestrate those objects.
+
+Tools:
+  python      → write & execute pandas/python-docx code against workspace objects
+  web_search  → search the internet for live information
+  chart       → request an explicit chart (charts are also auto-generated)\
 """
 
 _USER = """\
-DATAFRAME SCHEMA
-{schema_block}
-
-AVAILABLE TOOLS
-  pandas      — query/aggregate the DataFrame (use for all data operations)
-  web_search  — search the internet for news, odds, injuries, schedules
+{workspace_block}
 
 USER REQUEST
 "{query}"
 
-Break this into {min}–{max} steps. Return ONLY valid JSON:
+Decompose into {min}–{max} steps. Return ONLY valid JSON:
 {{
   "steps": [
     {{
-      "id": "snake_case_id",
-      "description": "exactly what to compute or search",
-      "tool": "pandas"
+      "id":          "snake_case_id",
+      "description": "exactly what to compute or fetch (reference objects by name)",
+      "tool":        "python",
+      "targets":     ["object_name_1", "..."]
     }}
   ]
 }}
 
 Rules:
-- ids must be lowercase snake_case
-- descriptions must reference exact column names from the schema
-- order: totals → rates → breakdowns → rankings → web enrichment
-- use "web_search" tool only when live data (injuries/news/odds) is needed
-- do not add a "generate chart" step — charts are auto-generated
+- ids are lowercase snake_case
+- descriptions reference workspace objects by name (e.g. "join spreadsheets['crm'] with tables['contract__table_1']")
+- targets must be a subset of object names from the workspace block above (use [] if none)
+- order: read/filter → compute → join/merge → write/export → web enrichment last
+- use "web_search" only when external/live data is needed
 - max {max} steps\
 """
-
-
-# ---------------------------------------------------------------------------
-# Compact schema for planner prompt
-# ---------------------------------------------------------------------------
-
-def _compact_schema(schema: SchemaInfo) -> str:
-    lines = [f"Shape : {schema.shape[0]:,} rows × {schema.shape[1]} columns", "Columns:"]
-    for col in schema.columns:
-        sem   = schema.semantics.get(col, "")
-        dtype = schema.dtypes.get(col, "")
-        tag   = f"  [{sem}]" if sem else ""
-        lines.append(f"  {col!r:<24} {dtype}{tag}")
-    if schema.unique_sports:
-        lines.append(f"Sport values  : {', '.join(schema.unique_sports[:15])}")
-    if schema.unique_results:
-        lines.append(f"Result values : {', '.join(schema.unique_results)}")
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
 # Response parsing
 # ---------------------------------------------------------------------------
 
-_VALID_TOOLS = {"pandas", "web_search", "chart"}
-
-
-def _parse_steps(raw: str) -> list[dict]:
-    """Extract [{id, description, tool}] from LLM response. Tolerates minor formatting errors."""
+def _parse_steps(raw: str, known_names: set[str]) -> list[dict]:
+    """Extract [{id, description, tool, targets}] from LLM response."""
     raw = re.sub(r"```(?:json)?\n?", "", raw).strip()
 
     try:
         data  = json.loads(raw)
         steps = data.get("steps", [])
-        valid = []
+        valid: list[dict] = []
         for s in steps:
             if "id" not in s or "description" not in s:
                 continue
-            tool = str(s.get("tool", "pandas")).lower()
+            tool = str(s.get("tool", "python")).lower()
+            if tool == "pandas":
+                tool = "python"
             if tool not in _VALID_TOOLS:
-                tool = "pandas"
+                tool = "python"
+            targets = s.get("targets") or []
+            if not isinstance(targets, list):
+                targets = [str(targets)]
+            # Filter targets to known names; ignore hallucinated ones
+            targets = [str(t) for t in targets if str(t) in known_names]
             valid.append({
                 "id":          str(s["id"]),
                 "description": str(s["description"]),
                 "tool":        tool,
+                "targets":     targets,
             })
         if valid:
             return valid[:MAX_STEPS]
@@ -118,38 +112,45 @@ def _parse_steps(raw: str) -> list[dict]:
     # Line-based fallback
     log.warning("planner: JSON parse failed — using line fallback")
     lines    = [l.strip() for l in raw.splitlines() if l.strip()]
-    fallback = []
+    fallback: list[dict] = []
     for i, line in enumerate(lines[:MAX_STEPS], 1):
         line = re.sub(r'^[\d\-\*\."\']+\s*', "", line).strip()
         if len(line) > 8:
-            fallback.append({"id": f"step_{i}", "description": line, "tool": "pandas"})
-    return fallback or [{"id": "full_analysis", "description": "Analyse the dataset", "tool": "pandas"}]
+            fallback.append({"id": f"step_{i}", "description": line,
+                             "tool": "python", "targets": []})
+    return fallback or [{"id": "full_analysis", "description": "Inspect the workspace",
+                          "tool": "python", "targets": []}]
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def plan_steps(query: str, schema: SchemaInfo) -> list[dict]:
+def plan_steps(query: str, workspace: "Workspace") -> list[dict]:
     """
-    Decompose `query` into an ordered list of steps.
+    Plan a sequence of steps against the live workspace.
 
     Returns:
-        [{"id": str, "description": str, "tool": "pandas"|"web_search"}, ...]
+        [{"id": str, "description": str, "tool": str, "targets": list[str]}, ...]
     """
+    from core import compile_context  # noqa: PLC0415  (avoid cycle on bare import)
+    workspace_block = compile_context(workspace, query=query, include_memory=True)
+
     messages = [
         {"role": "system", "content": _SYSTEM},
         {"role": "user",   "content": _USER.format(
-            schema_block=_compact_schema(schema),
+            workspace_block=workspace_block,
             query=query,
             min=MIN_STEPS,
             max=MAX_STEPS,
         )},
     ]
 
-    log.debug("planner: query=%r", query[:80])
+    log.debug("planner: query=%r objects=%d", query[:80], len(workspace.all_objects()))
     raw   = call_chat(messages, stream_to_stdout=False)
-    steps = _parse_steps(raw)
+    known_names = {o.name for o in workspace.all_objects()}
+    steps = _parse_steps(raw, known_names)
 
-    log.debug("planner: %d steps — %s", len(steps), [(s["id"], s["tool"]) for s in steps])
+    log.debug("planner: %d steps — %s",
+              len(steps), [(s["id"], s["tool"], s["targets"]) for s in steps])
     return steps

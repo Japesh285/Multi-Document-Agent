@@ -58,8 +58,12 @@ from pydantic import BaseModel
 import app as agent_app
 import sessions
 from loaders import SUPPORTED_EXTENSIONS, LoaderError, load_any
+from loaders.docx import DocumentLoadError, load_docx
 from schema import build_schema, SchemaInfo
 from utils import get_logger
+
+# Workspace extensions = spreadsheet extensions + .docx
+WORKSPACE_EXTENSIONS = SUPPORTED_EXTENSIONS | {".docx"}
 
 log = get_logger("server")
 
@@ -116,43 +120,46 @@ def _activate_session(
     sheet: str | None = None,
     force: bool = False,
 ) -> sessions.SessionRecord:
-    """Load the given session's spreadsheet into agent_app's globals."""
+    """Load the given session's spreadsheet/document into the workspace."""
     global _active_session_id
 
     rec = sessions.get_session(session_id)
     if rec is None:
         raise HTTPException(404, f"Session {session_id} not found")
 
-    if (not force
-        and _active_session_id == session_id
-        and not agent_app._df.empty
-        and (sheet is None or sheet == agent_app._active_sheet)):
-        return rec  # already active on the right sheet
-
     file_path = Path(rec.file_path)
     if not file_path.exists():
         raise HTTPException(
             400,
-            f"Source file no longer exists: {file_path}. Re-upload the spreadsheet.",
+            f"Source file no longer exists: {file_path}. Re-upload the file.",
         )
 
+    ws = agent_app.get_workspace()
+    same_session = _active_session_id == session_id
+
+    # Skip reload if same session AND sheet matches (or no sheet was requested)
+    if not force and same_session and not ws.is_empty():
+        active_ss = ws.active_spreadsheet
+        if active_ss is None or sheet is None or sheet == active_ss.active_sheet:
+            return rec
+
+    # Always start the session with a fresh workspace
+    agent_app._reset_workspace()
+    ws = agent_app.get_workspace()
+
     try:
-        loaded = load_any(str(file_path), sheet=sheet)
-    except LoaderError as exc:
-        raise HTTPException(400, f"Failed to load spreadsheet: {exc}")
+        suffix = file_path.suffix.lower()
+        if suffix == ".docx":
+            ws.register_document_from_path(str(file_path))
+        else:
+            ws.register_spreadsheet_from_path(str(file_path), sheet=sheet)
+    except (LoaderError, DocumentLoadError) as exc:
+        raise HTTPException(400, f"Failed to load file: {exc}")
 
-    schema = build_schema(loaded.df, str(file_path), loaded=loaded)
-
-    agent_app._df           = loaded.df
-    agent_app._schema       = schema
-    agent_app._excel_path   = str(file_path)
-    agent_app._workbook     = loaded
-    agent_app._active_sheet = loaded.active_sheet
-    _active_session_id      = session_id
+    _active_session_id = session_id
     sessions.touch_session(session_id)
 
-    log.info("server: activated session %s (%s, sheet=%r)",
-             session_id, file_path.name, loaded.active_sheet)
+    log.info("server: activated session %s (%s)", session_id, file_path.name)
     return rec
 
 
@@ -254,12 +261,17 @@ async def health():
     except Exception as exc:
         ollama_error = str(exc)
 
+    ws = agent_app.get_workspace()
     return {
         "status":    "ok",
         "version":   app.version,
         "ollama":    {"reachable": ollama_ok, "error": ollama_error},
         "session":   _active_session_id,
-        "df_loaded": not agent_app._df.empty,
+        "workspace": {
+            "spreadsheets": len(ws.spreadsheets),
+            "documents":    len(ws.documents),
+            "tables":       len(ws.tables),
+        },
     }
 
 
@@ -272,30 +284,48 @@ async def create_session(req: CreateSessionRequest):
     fp = Path(req.file_path)
     if not fp.exists():
         raise HTTPException(400, f"File not found: {fp}")
-    if fp.suffix.lower() not in SUPPORTED_EXTENSIONS:
+    suffix = fp.suffix.lower()
+    if suffix not in WORKSPACE_EXTENSIONS:
         raise HTTPException(
             400,
-            f"Unsupported file type '{fp.suffix}'. "
-            f"Supported: {sorted(SUPPORTED_EXTENSIONS)}",
+            f"Unsupported file type '{suffix}'. "
+            f"Supported: {sorted(WORKSPACE_EXTENSIONS)}",
         )
 
     try:
-        loaded = load_any(str(fp))
-        schema = build_schema(loaded.df, str(fp), loaded=loaded)
-    except LoaderError as exc:
-        raise HTTPException(400, f"Failed to load spreadsheet: {exc}")
+        if suffix == ".docx":
+            doc_obj = load_docx(str(fp))
+            schema_dict = {
+                "file_path":  str(fp),
+                "file_type":  "docx",
+                "shape":      {"rows": len(doc_obj.paragraphs), "columns": 0},
+                "columns":    [],
+                "domain":     "document",
+                "domain_confidence": 1.0,
+                "metadata":   doc_obj.metadata,
+            }
+            rows, cols = len(doc_obj.paragraphs), 0
+            domain, dconf = "document", 1.0
+        else:
+            loaded = load_any(str(fp))
+            schema = build_schema(loaded.df, str(fp), loaded=loaded)
+            schema_dict = _schema_to_dict(schema)
+            rows, cols = schema.shape
+            domain, dconf = schema.domain, schema.domain_confidence
+    except (LoaderError, DocumentLoadError) as exc:
+        raise HTTPException(400, f"Failed to load file: {exc}")
 
     rec = sessions.create_session(
         file_path=str(fp),
         name=req.name,
-        rows=schema.shape[0],
-        columns=schema.shape[1],
-        domain=schema.domain,
-        domain_confidence=schema.domain_confidence,
-        schema_dict=_schema_to_dict(schema),
+        rows=rows,
+        columns=cols,
+        domain=domain,
+        domain_confidence=dconf,
+        schema_dict=schema_dict,
     )
     _activate_session(rec.id)
-    return {"session": rec.to_dict(), "schema": _schema_to_dict(schema)}
+    return {"session": rec.to_dict(), "schema": schema_dict}
 
 
 @app.get("/sessions")
@@ -314,7 +344,14 @@ async def get_session_detail(session_id: str):
 @app.post("/sessions/{session_id}/activate")
 async def activate_session(session_id: str):
     rec = _activate_session(session_id)
-    return {"session": rec.to_dict(), "schema": _schema_to_dict(agent_app._schema)}
+    ws = agent_app.get_workspace()
+    active = ws.active_spreadsheet
+    schema_payload = _schema_to_dict(active.schema) if (active and active.schema) else {}
+    return {
+        "session":   rec.to_dict(),
+        "schema":    schema_payload,
+        "workspace": ws.inventory_dict(),
+    }
 
 
 @app.delete("/sessions/{session_id}")
@@ -323,11 +360,7 @@ async def delete_session(session_id: str):
     sessions.delete_session(session_id)
     if _active_session_id == session_id:
         _active_session_id = None
-        agent_app._df           = pd.DataFrame()
-        agent_app._schema       = None
-        agent_app._excel_path   = ""
-        agent_app._workbook     = None
-        agent_app._active_sheet = ""
+        agent_app._reset_workspace()
     return {"ok": True}
 
 
@@ -350,8 +383,9 @@ async def list_sheets(session_id: str):
 async def activate_sheet(session_id: str, sheet_name: str):
     """Switch the active sheet of a session and rebuild its schema."""
     _activate_session(session_id, sheet=sheet_name, force=True)
-    schema_dict = _schema_to_dict(agent_app._schema)
-    # Persist new active_sheet into the session's stored schema
+    ws = agent_app.get_workspace()
+    active = ws.active_spreadsheet
+    schema_dict = _schema_to_dict(active.schema) if (active and active.schema) else {}
     sessions.update_session_schema(session_id, schema_dict)
     return {"schema": schema_dict, "active_sheet": sheet_name}
 
@@ -401,15 +435,14 @@ async def upload(file: UploadFile = File(...)):
         raise HTTPException(400, "Empty filename")
 
     suffix = Path(file.filename).suffix.lower()
-    if suffix not in SUPPORTED_EXTENSIONS:
+    if suffix not in WORKSPACE_EXTENSIONS:
         raise HTTPException(
             400,
             f"Unsupported file type '{suffix}'. "
-            f"Supported: {sorted(SUPPORTED_EXTENSIONS)}",
+            f"Supported: {sorted(WORKSPACE_EXTENSIONS)}",
         )
 
     dest = UPLOAD_DIR / file.filename
-    # Avoid collisions
     if dest.exists():
         ts = int(time.time())
         dest = UPLOAD_DIR / f"{dest.stem}_{ts}{dest.suffix}"
@@ -420,31 +453,127 @@ async def upload(file: UploadFile = File(...)):
     log.info("server: upload saved %s (%.1f KB)", dest, dest.stat().st_size / 1024)
 
     try:
-        loaded = load_any(str(dest))
-        schema = build_schema(loaded.df, str(dest), loaded=loaded)
-    except LoaderError as exc:
+        if suffix == ".docx":
+            doc_obj = load_docx(str(dest))
+            schema_dict = {
+                "file_path": str(dest),
+                "file_type": "docx",
+                "shape":     {"rows": len(doc_obj.paragraphs), "columns": 0},
+                "columns":   [],
+                "domain":    "document",
+                "domain_confidence": 1.0,
+                "metadata":  doc_obj.metadata,
+                "sections":  [s["name"] for s in doc_obj.sections],
+            }
+            rows, cols = len(doc_obj.paragraphs), 0
+            domain, dconf = "document", 1.0
+            metadata_payload = {
+                "file_type":  "docx",
+                "paragraphs": len(doc_obj.paragraphs),
+                "tables":     len(doc_obj.table_names),
+                "sections":   [s["name"] for s in doc_obj.sections],
+            }
+        else:
+            loaded = load_any(str(dest))
+            schema = build_schema(loaded.df, str(dest), loaded=loaded)
+            schema_dict = _schema_to_dict(schema)
+            rows, cols = schema.shape
+            domain, dconf = schema.domain, schema.domain_confidence
+            metadata_payload = loaded.to_metadata_dict()
+    except (LoaderError, DocumentLoadError) as exc:
         log.warning("server: load failed for %s — %s", dest.name, exc)
-        raise HTTPException(400, f"Failed to parse spreadsheet: {exc}")
+        raise HTTPException(400, f"Failed to parse file: {exc}")
     except Exception as exc:
         log.exception("server: unexpected load error")
-        raise HTTPException(400, f"Failed to parse spreadsheet: {exc}")
+        raise HTTPException(400, f"Failed to parse file: {exc}")
 
     rec = sessions.create_session(
         file_path=str(dest),
         name=dest.stem,
-        rows=schema.shape[0],
-        columns=schema.shape[1],
-        domain=schema.domain,
-        domain_confidence=schema.domain_confidence,
-        schema_dict=_schema_to_dict(schema),
+        rows=rows,
+        columns=cols,
+        domain=domain,
+        domain_confidence=dconf,
+        schema_dict=schema_dict,
     )
     _activate_session(rec.id)
     return {
         "session":   rec.to_dict(),
-        "schema":    _schema_to_dict(schema),
+        "schema":    schema_dict,
         "file_path": str(dest),
-        "metadata":  loaded.to_metadata_dict(),
+        "metadata":  metadata_payload,
     }
+
+
+# ---------------------------------------------------------------------------
+# Workspace inspection / multi-object operations
+# ---------------------------------------------------------------------------
+
+@app.get("/workspace")
+async def workspace_inventory():
+    """Full inventory of the currently-active workspace."""
+    return agent_app.get_workspace().inventory_dict()
+
+
+@app.post("/workspace/add")
+async def workspace_add(file: UploadFile = File(...)):
+    """
+    Add another spreadsheet or document to the *currently-active* workspace
+    without creating a new session. Returns the updated inventory.
+    """
+    if _active_session_id is None:
+        raise HTTPException(400, "No active session — upload via /upload first.")
+    if not file.filename:
+        raise HTTPException(400, "Empty filename")
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in WORKSPACE_EXTENSIONS:
+        raise HTTPException(
+            400,
+            f"Unsupported file type '{suffix}'. Supported: {sorted(WORKSPACE_EXTENSIONS)}",
+        )
+
+    dest = UPLOAD_DIR / file.filename
+    if dest.exists():
+        ts = int(time.time())
+        dest = UPLOAD_DIR / f"{dest.stem}_{ts}{dest.suffix}"
+    with dest.open("wb") as out:
+        shutil.copyfileobj(file.file, out)
+
+    ws = agent_app.get_workspace()
+    try:
+        if suffix == ".docx":
+            obj = ws.register_document_from_path(str(dest))
+            kind = "document"
+        else:
+            obj = ws.register_spreadsheet_from_path(str(dest))
+            kind = "spreadsheet"
+    except (LoaderError, DocumentLoadError) as exc:
+        raise HTTPException(400, f"Failed to parse {dest.name}: {exc}")
+
+    log.info("server: workspace.add %s:%s", kind, obj.name)
+    return {
+        "added":     {"kind": kind, "name": obj.name, "path": str(dest)},
+        "workspace": ws.inventory_dict(),
+    }
+
+
+@app.post("/workspace/activate")
+async def workspace_activate(name: str = Body(..., embed=True)):
+    """Mark an existing workspace object as the active one (touches it in memory)."""
+    ws = agent_app.get_workspace()
+    obj = ws.get(name)
+    if obj is None:
+        raise HTTPException(404, f"No workspace object named {name!r}")
+    ws.memory.touch(name)
+    return {"active": name, "kind": obj.kind, "workspace": ws.inventory_dict()}
+
+
+@app.delete("/workspace/objects/{name}")
+async def workspace_remove(name: str):
+    ws = agent_app.get_workspace()
+    if not ws.remove(name):
+        raise HTTPException(404, f"No workspace object named {name!r}")
+    return {"removed": name, "workspace": ws.inventory_dict()}
 
 
 # ---------------------------------------------------------------------------
@@ -688,11 +817,13 @@ async def export_report(report_id: str, fmt: str):
         return _text_response(html, f"{title}.html", "text/html")
 
     if fmt == "xlsx":
-        # Export the active session's DataFrame
-        if agent_app._df.empty:
-            raise HTTPException(400, "No active dataframe to export")
+        # Export the active spreadsheet's DataFrame
+        ws = agent_app.get_workspace()
+        active = ws.active_spreadsheet
+        if active is None or active.df.empty:
+            raise HTTPException(400, "No active spreadsheet to export")
         buf = io.BytesIO()
-        agent_app._df.to_excel(buf, index=False, engine="openpyxl")
+        active.df.to_excel(buf, index=False, engine="openpyxl")
         buf.seek(0)
         return StreamingResponse(
             buf,

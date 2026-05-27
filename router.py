@@ -25,6 +25,8 @@ INTENTS = [
     "data_query",
     "report_generation",
     "excel_modification",
+    "document_modification",
+    "workspace_operation",
     "internet_research",
     "hybrid_analysis",
     "chart_generation",
@@ -43,9 +45,25 @@ _KEYWORD_MAP: dict[str, list[str]] = {
         "fetch", "retrieve", "tell me",
     ],
     "excel_modification": [
-        "add column", "add a column", "update", "modify", "change",
-        "write back", "save to", "risk level", "label", "flag",
-        "mark", "append column", "create field", "enrich", "annotate",
+        "add column", "add a column", "update column", "write back",
+        "risk level", "label", "flag", "mark", "append column",
+        "create field", "enrich", "annotate",
+    ],
+    "document_modification": [
+        "edit the doc", "edit the document", "update the doc",
+        "update the document", "rewrite", "replace text",
+        "insert paragraph", "append to the doc", "modify the contract",
+        "update the contract", "change the contract", "add to the document",
+        "inject", "fill in the doc", "fill the template",
+    ],
+    "workspace_operation": [
+        "from the doc", "from the document", "from the contract",
+        "into the doc", "into the document", "into the spreadsheet",
+        "match against", "cross-reference", "join with the doc",
+        "convert to docx", "convert to spreadsheet",
+        "export to docx", "export to xlsx", "export to csv",
+        "extract from the document", "extract from the contract",
+        "compare with the doc", "compare with the document",
     ],
     "internet_research": [
         "news", "injury", "injuries", "latest", "current", "live",
@@ -147,12 +165,14 @@ def _keyword_classify(query: str) -> tuple[str, float, str]:
 _LLM_SYSTEM = "You are an intent classifier. Reply with ONLY one intent name."
 _LLM_USER   = """\
 Classify this query into exactly one intent:
-  data_query          — retrieve / filter / count data
-  report_generation   — multi-step analysis and written report
-  excel_modification  — add/update/write columns to the spreadsheet
-  internet_research   — search web, news, live odds/injuries
-  hybrid_analysis     — combines data analysis + web search
-  chart_generation    — produce a chart or visualisation
+  data_query             — retrieve / filter / count data
+  report_generation      — multi-step analysis and written report
+  excel_modification     — add/update/write columns to a spreadsheet
+  document_modification  — edit, rewrite or update a Word document
+  workspace_operation    — cross-object work spanning spreadsheets + documents
+  internet_research      — search web, news, live odds/injuries
+  hybrid_analysis        — combines data analysis + web search
+  chart_generation       — produce a chart or visualisation
 
 Query: "{query}"
 
