@@ -1,0 +1,91 @@
+# =============================================================================
+# Spreadsheet Agent — .gitignore
+# Commits source code (.py, .ts, .tsx, .rs, .json, .bat, README). Excludes
+# generated artifacts, vendored dependencies, runtime data, secrets, and
+# personal/IDE state.
+# =============================================================================
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Virtualenv (created by setup.bat)
+venv/
+.venv/
+env/
+ENV/
+
+# ---------- Node / Vite (desktop frontend) ----------
+node_modules/
+desktop/node_modules/
+desktop/dist/
+desktop/.vite/
+*.tsbuildinfo
+
+# ---------- Rust / Tauri (desktop shell) ----------
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+**/*.rs.bk
+
+# ---------- App runtime output ----------
+# Everything under output/ is generated at runtime: SQLite DB, generated
+# charts, synthesized reports, search cache, uploaded spreadsheets,
+# Excel backups. Never commit.
+output/
+
+# ---------- Logs ----------
+*.log
+logs/
+
+# ---------- Secrets / local config ----------
+.env
+.env.*
+!.env.example
+*.local
+secrets.json
+credentials.json
+
+# ---------- Claude Code state ----------
+# Local AI assistant config & generated docs — not part of the project source.
+.claude/
+CODEBASE_REFERENCE.md
+
+# ---------- IDE / editor ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---------- OS ----------
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ---------- Windows shortcuts (personal) ----------
+*.lnk
+
+# ---------- User data spreadsheets ----------
+# Sample/personal spreadsheets the dev may keep at the repo root.
+# Force-add a specific sample with: git add -f sample.xlsx
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+*.tsv
+
+# ---------- Build / test scratch ----------
+_smoke_*.py
+*.tmp
+*.bak

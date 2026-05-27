@@ -1,0 +1,106 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ----- Globals ------------------------------------------------------------ */
+
+:root {
+  color-scheme: dark;
+}
+
+html, body, #root {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-feature-settings: "cv05", "cv11", "ss03";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ----- Scrollbars --------------------------------------------------------- */
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: theme(colors.ink.600);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: theme(colors.ink.500);
+}
+
+/* ----- Markdown ----------------------------------------------------------- */
+
+.prose-agent {
+  @apply text-[13.5px] leading-relaxed text-chalk-100;
+}
+.prose-agent h1 { @apply text-xl font-semibold mt-2 mb-3 text-chalk-50; }
+.prose-agent h2 { @apply text-base font-semibold mt-4 mb-2 text-accent-400 border-b border-ink-700 pb-1; }
+.prose-agent h3 { @apply text-sm font-semibold mt-3 mb-1.5 text-chalk-200; }
+.prose-agent p  { @apply my-2; }
+.prose-agent ul { @apply list-disc list-outside ml-5 my-2 space-y-1; }
+.prose-agent ol { @apply list-decimal list-outside ml-5 my-2 space-y-1; }
+.prose-agent strong { @apply text-chalk-50 font-semibold; }
+.prose-agent code   { @apply font-mono text-[12px] bg-ink-800 px-1.5 py-0.5 rounded text-accent-400; }
+.prose-agent pre    { @apply font-mono text-[12px] bg-ink-900 border border-ink-700 p-3 rounded-md overflow-x-auto my-2; }
+.prose-agent pre code { @apply bg-transparent p-0 text-chalk-100; }
+.prose-agent a   { @apply text-accent-400 underline-offset-2 hover:underline; }
+.prose-agent blockquote { @apply border-l-2 border-ink-600 pl-3 italic text-chalk-300; }
+.prose-agent table { @apply w-full text-[12.5px] my-3 border-collapse; }
+.prose-agent th    { @apply text-left font-semibold border-b border-ink-700 py-1.5 px-2 text-chalk-200; }
+.prose-agent td    { @apply border-b border-ink-800 py-1.5 px-2; }
+
+/* ----- Utility components ------------------------------------------------- */
+
+.pane {
+  @apply bg-ink-900 border border-ink-700 rounded-lg shadow-pane;
+}
+
+.chip {
+  @apply inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full
+         text-[11px] font-medium bg-ink-800 text-chalk-200
+         border border-ink-700 shadow-chip;
+}
+
+.btn {
+  @apply inline-flex items-center justify-center gap-1.5 px-3 py-1.5
+         rounded-md text-[12.5px] font-medium select-none
+         transition-colors duration-100;
+}
+.btn-primary {
+  @apply btn bg-accent-600 hover:bg-accent-500 text-white
+         disabled:bg-ink-700 disabled:text-chalk-400 disabled:cursor-not-allowed;
+}
+.btn-ghost {
+  @apply btn bg-transparent hover:bg-ink-800 text-chalk-200
+         border border-ink-700 hover:border-ink-600;
+}
+.btn-icon {
+  @apply inline-flex items-center justify-center w-7 h-7 rounded-md
+         text-chalk-300 hover:text-chalk-50 hover:bg-ink-800
+         transition-colors duration-100;
+}
+
+.input {
+  @apply w-full bg-ink-850 border border-ink-700 rounded-md px-3 py-1.5
+         text-[13px] text-chalk-100 placeholder-chalk-400
+         focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500/40;
+}
+
+.kbd {
+  @apply font-mono text-[10px] bg-ink-800 border border-ink-700
+         rounded px-1 py-0.5 text-chalk-300;
+}
+
+/* ----- Status dot --------------------------------------------------------- */
+
+.status-dot {
+  @apply inline-block w-1.5 h-1.5 rounded-full;
+}
+.status-dot.ok   { @apply bg-signal-ok animate-pulse-dot; }
+.status-dot.warn { @apply bg-signal-warn; }
+.status-dot.err  { @apply bg-signal-err; }
+.status-dot.info { @apply bg-signal-info; }
+.status-dot.idle { @apply bg-ink-500; }
