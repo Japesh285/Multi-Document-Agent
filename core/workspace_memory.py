@@ -144,6 +144,7 @@ class WorkspaceMemory:
         detail: str = "",
         success: bool = True,
         error: str = "",
+        workspace=None,
     ) -> MutationRecord:
         rec = MutationRecord(
             timestamp=_now(),
@@ -156,6 +157,13 @@ class WorkspaceMemory:
         )
         self.mutations.append(rec)
         self.touch(object_name)
+        # Mutations change the data — rebuild the static snapshot so the
+        # next query sees the post-mutation state.
+        if success and workspace is not None:
+            try:
+                workspace.refresh_snapshot_for(object_name)
+            except Exception:
+                pass
         return rec
 
     # ------------------------------------------------------------------

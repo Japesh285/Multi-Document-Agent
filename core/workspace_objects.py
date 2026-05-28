@@ -43,6 +43,18 @@ class WorkspaceObject:
     source_path: str = ""                        # original file path (may be "")
     created_at: str = ""                         # ISO timestamp
     metadata: dict = field(default_factory=dict)
+    # Deterministic data snapshot — populated by core.snapshot.refresh_snapshot
+    # at registration time and rebuilt on mutation. "" until first build.
+    snapshot: str = field(default="", repr=False)
+
+    # ------------------------------------------------------------------
+    # Defaults — subclasses override
+    # ------------------------------------------------------------------
+
+    @property
+    def capabilities(self) -> list[str]:
+        """What the LLM is allowed to do with this object."""
+        return ["read"]
 
     # ------------------------------------------------------------------
     # Must be overridden — used by the context compiler
@@ -80,6 +92,11 @@ class SpreadsheetObject(WorkspaceObject):
     loaded: "LoadedSpreadsheet | None" = None
     schema: "SchemaInfo | None"        = None
     kind: str                          = "spreadsheet"
+
+    @property
+    def capabilities(self) -> list[str]:
+        return ["read", "filter", "aggregate", "add_column",
+                "update_rows", "save", "chart"]
 
     # ------------------------------------------------------------------
     # Convenience properties — these are what LLM-generated code calls
@@ -176,6 +193,21 @@ class TableObject(WorkspaceObject):
     kind: str                         = "table"
 
     @property
+    def schema(self) -> dict:
+        return {
+            "kind":    "table",
+            "shape":   self.shape,
+            "columns": self.columns,
+            "dtypes":  {c: str(dt) for c, dt in self.df.dtypes.items()},
+            "source":  {"kind": self.source_kind, "object": self.source_object,
+                        "locator": self.source_locator},
+        }
+
+    @property
+    def capabilities(self) -> list[str]:
+        return ["read", "filter", "aggregate", "join", "save_to_spreadsheet"]
+
+    @property
     def columns(self) -> list[str]:
         return list(self.df.columns)
 
@@ -207,15 +239,82 @@ class TableObject(WorkspaceObject):
 
 @dataclass
 class DocumentObject(WorkspaceObject):
-    """A python-docx Document plus its extracted structure."""
+    """A python-docx Document, or an OCR-extracted document, plus structure."""
 
-    doc: Any                      = None        # python-docx Document
-    paragraphs: list[str]         = field(default_factory=list)   # plain text per para
+    doc: Any                      = None        # python-docx Document (None for OCR docs)
+    paragraphs: list[str]         = field(default_factory=list)   # plain text per para / page
     headings:   list[dict]        = field(default_factory=list)   # [{level, text, index}]
     sections:   list[dict]        = field(default_factory=list)   # [{name, paragraph_start, paragraph_end}]
     table_names: list[str]        = field(default_factory=list)   # workspace names of extracted tables
     word_count: int               = 0
+    # Optional OCR payload — populated by loaders.ocr.load_ocr().
+    # Stays None for native .docx documents.
+    ocr: Any                      = None        # loaders.ocr.OcrContext when present
     kind: str                     = "document"
+
+    @property
+    def schema(self) -> dict:
+        s: dict = {
+            "kind":          "ocr_document" if self.is_ocr else "docx_document",
+            "paragraphs":    len(self.paragraphs),
+            "word_count":    self.word_count,
+            "sections":      [s.get("name", "") for s in self.sections],
+            "tables":        list(self.table_names),
+        }
+        if self.is_ocr and self.ocr is not None:
+            s["page_count"]         = self.ocr.page_count
+            s["language"]           = self.ocr.language
+            s["confidence_summary"] = dict(self.ocr.confidence_summary or {})
+            s["source_kind"]        = self.ocr.source_kind
+        return s
+
+    @property
+    def capabilities(self) -> list[str]:
+        if self.is_ocr:
+            return ["read", "search_text", "list_pages", "read_tables"]
+        return ["read", "find_paragraphs", "replace_text", "add_paragraph",
+                "add_heading", "add_table_from_df", "save"]
+
+    # ------------------------------------------------------------------
+    # OCR convenience
+    # ------------------------------------------------------------------
+
+    @property
+    def is_ocr(self) -> bool:
+        return self.ocr is not None
+
+    @property
+    def ocr_pages(self) -> list:
+        return self.ocr.pages if self.ocr is not None else []
+
+    @property
+    def ocr_tables(self) -> list:
+        return self.ocr.tables if self.ocr is not None else []
+
+    @property
+    def ocr_lines(self) -> list:
+        return self.ocr.lines if self.ocr is not None else []
+
+    @property
+    def ocr_blocks(self) -> list:
+        return self.ocr.blocks if self.ocr is not None else []
+
+    @property
+    def ocr_words(self) -> list:
+        return self.ocr.words if self.ocr is not None else []
+
+    @property
+    def ocr_metadata(self) -> dict:
+        if self.ocr is None:
+            return {}
+        return {
+            "source_kind":        self.ocr.source_kind,
+            "language":           self.ocr.language,
+            "page_count":         self.ocr.page_count,
+            "confidence_summary": self.ocr.confidence_summary,
+            "timings":            self.ocr.timings,
+            "warnings":           list(self.ocr.warnings),
+        }
 
     # ------------------------------------------------------------------
     # Read helpers
@@ -329,6 +428,13 @@ class DocumentObject(WorkspaceObject):
             section_names = [h["text"] for h in self.headings[:5]]
         section_str = ", ".join(section_names[:5]) or "—"
         tcount = len(self.table_names)
+        if self.is_ocr:
+            kind_tag = f"OCR/{self.ocr.source_kind}"
+            extra    = (
+                f"  {self.ocr.page_count} page(s), {tcount} table(s),"
+                f" conf {self.ocr.confidence_summary.get('word_confidence_mean', 0):.0f}"
+            )
+            return f"{self.name}  [{kind_tag}]{extra}  sections: {section_str}"
         return (
             f"{self.name}  ({len(self.paragraphs)} paragraphs, "
             f"{tcount} table{'s' if tcount != 1 else ''}, "
@@ -336,6 +442,9 @@ class DocumentObject(WorkspaceObject):
         )
 
     def shape_hint(self) -> str:
+        if self.is_ocr:
+            q = self.ocr.confidence_summary.get("quality", "")
+            return f"ocr_quality={q}; tables: {', '.join(self.table_names[:4]) or '—'}"
         if self.table_names:
             return f"tables: {', '.join(self.table_names[:4])}"
         return ""

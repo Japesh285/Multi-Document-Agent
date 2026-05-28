@@ -4,6 +4,7 @@
 import type {
   AgentOutput, ChartRecord, ChatMessage, HealthInfo, MutationRecord,
   OllamaStatus, RecentFile, ReportRecord, SessionRecord, SessionSchema,
+  WorkspaceInventory,
 } from "../types";
 
 let BASE = "http://127.0.0.1:8765";
@@ -51,11 +52,20 @@ export const sessionReports  = (id: string) => req<{ reports: ReportRecord[] }>(
 
 // ── Files ─────────────────────────────────────────────────────────────────
 
-export async function uploadFile(file: File): Promise<{ session: SessionRecord; schema: SessionSchema; file_path: string }> {
+export async function uploadFile(file: File): Promise<{
+  session: SessionRecord;
+  schema: SessionSchema;
+  file_path: string;
+  metadata?: Record<string, unknown>;
+}> {
   const fd = new FormData();
   fd.append("file", file);
   const r = await fetch(`${BASE}/upload`, { method: "POST", body: fd });
-  if (!r.ok) throw new Error(`upload failed: ${r.status} ${r.statusText}`);
+  if (!r.ok) {
+    let msg = `upload failed: ${r.status} ${r.statusText}`;
+    try { const b = await r.json(); if (b?.detail) msg = b.detail; } catch { /* ignore */ }
+    throw new Error(msg);
+  }
   return r.json();
 }
 
@@ -68,6 +78,37 @@ export async function createSessionFromPath(file_path: string, name?: string) {
 }
 
 export const listRecentFiles = () => req<{ files: RecentFile[] }>("/recent");
+
+// ── Workspace (multi-object) ──────────────────────────────────────────────
+
+export const getWorkspace = () => req<WorkspaceInventory>("/workspace");
+
+export async function addToWorkspace(file: File): Promise<{
+  added: { kind: string; name: string; path: string };
+  workspace: WorkspaceInventory;
+}> {
+  const fd = new FormData();
+  fd.append("file", file);
+  const r = await fetch(`${BASE}/workspace/add`, { method: "POST", body: fd });
+  if (!r.ok) {
+    let msg = `add failed: ${r.status} ${r.statusText}`;
+    try { const b = await r.json(); if (b?.detail) msg = b.detail; } catch { /* ignore */ }
+    throw new Error(msg);
+  }
+  return r.json();
+}
+
+export const activateWorkspaceObject = (name: string) =>
+  req<{ active: string; kind: string; workspace: WorkspaceInventory }>(
+    "/workspace/activate",
+    { method: "POST", body: JSON.stringify({ name }) },
+  );
+
+export const removeWorkspaceObject = (name: string) =>
+  req<{ removed: string; workspace: WorkspaceInventory }>(
+    `/workspace/objects/${encodeURIComponent(name)}`,
+    { method: "DELETE" },
+  );
 
 // ── Query / analysis ──────────────────────────────────────────────────────
 

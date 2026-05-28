@@ -31,13 +31,34 @@ export const openExternal   = (url: string)  => invokeSafe<void>("open_external"
 
 // ── Native file picker ────────────────────────────────────────────────────
 
-export async function pickXlsxFile(): Promise<string | null> {
+/** Extensions that the backend's workspace layer understands. Kept in sync with
+ *  server.WORKSPACE_EXTENSIONS. */
+export const ALL_WORKSPACE_EXTS = [
+  // spreadsheets
+  "xlsx", "xls", "xlsm", "csv", "tsv", "txt",
+  // documents
+  "docx",
+  // OCR (PDFs + images)
+  "pdf", "png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff",
+];
+
+export const SPREADSHEET_EXTS = ["xlsx", "xls", "xlsm", "csv", "tsv"];
+export const DOCUMENT_EXTS    = ["docx"];
+export const OCR_EXTS         = ["pdf", "png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"];
+
+/** Open the native dialog for any supported file type. */
+export async function pickWorkspaceFile(): Promise<string | null> {
   if (!isTauri) return null;
   try {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const result = await open({
       multiple: false,
-      filters: [{ name: "Excel", extensions: ["xlsx", "xlsm", "xls"] }],
+      filters: [
+        { name: "All supported",  extensions: ALL_WORKSPACE_EXTS },
+        { name: "Spreadsheets",   extensions: SPREADSHEET_EXTS },
+        { name: "Word documents", extensions: DOCUMENT_EXTS },
+        { name: "PDFs & images",  extensions: OCR_EXTS },
+      ],
     });
     return typeof result === "string" ? result : null;
   } catch (err) {
@@ -45,6 +66,9 @@ export async function pickXlsxFile(): Promise<string | null> {
     return null;
   }
 }
+
+/** Back-compat alias used by call sites that historically only opened xlsx. */
+export const pickXlsxFile = pickWorkspaceFile;
 
 export async function saveFileDialog(defaultName: string, ext: string): Promise<string | null> {
   if (!isTauri) return null;

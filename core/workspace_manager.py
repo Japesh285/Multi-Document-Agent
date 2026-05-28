@@ -61,6 +61,9 @@ class Workspace:
     spreadsheets: dict[str, SpreadsheetObject] = field(default_factory=dict)
     documents:    dict[str, DocumentObject]    = field(default_factory=dict)
     tables:       dict[str, TableObject]       = field(default_factory=dict)
+    # Generated outputs (chart paths, report paths, derived dataframes).
+    # Workspace code writes to this via `workspace.artifacts[name] = value`.
+    artifacts:    dict                         = field(default_factory=dict)
     memory:       WorkspaceMemory              = field(default_factory=WorkspaceMemory)
     metadata:     dict                         = field(default_factory=dict)
 
@@ -99,11 +102,20 @@ class Workspace:
     # Direct registration
     # ------------------------------------------------------------------
 
+    def _refresh_snapshot(self, obj: WorkspaceObject) -> None:
+        """Pure-Python snapshot (no LLM). Cheap, deterministic."""
+        from .snapshot import refresh_snapshot  # noqa: PLC0415
+        try:
+            refresh_snapshot(obj)
+        except Exception as exc:
+            log.warning("workspace: snapshot build failed for %s — %s", obj.name, exc)
+
     def register_spreadsheet(self, obj: SpreadsheetObject) -> SpreadsheetObject:
         if obj.name in self.spreadsheets:
             obj.name = self._unique_name(obj.name, self.spreadsheets)
         obj.created_at = obj.created_at or _now()
         self.spreadsheets[obj.name] = obj
+        self._refresh_snapshot(obj)
         self.memory.touch(obj.name)
         log.info("workspace: registered spreadsheet %r (%d×%d)",
                  obj.name, obj.shape[0], obj.shape[1])
@@ -114,6 +126,7 @@ class Workspace:
             obj.name = self._unique_name(obj.name, self.documents)
         obj.created_at = obj.created_at or _now()
         self.documents[obj.name] = obj
+        self._refresh_snapshot(obj)
         self.memory.touch(obj.name)
         log.info("workspace: registered document %r (%d paragraphs, %d tables)",
                  obj.name, len(obj.paragraphs), len(obj.table_names))
@@ -124,10 +137,17 @@ class Workspace:
             obj.name = self._unique_name(obj.name, self.tables)
         obj.created_at = obj.created_at or _now()
         self.tables[obj.name] = obj
+        self._refresh_snapshot(obj)
         self.memory.touch(obj.name)
         log.info("workspace: registered table %r (%d×%d) from %s",
                  obj.name, obj.shape[0], obj.shape[1], obj.source_object or "—")
         return obj
+
+    def refresh_snapshot_for(self, name: str) -> None:
+        """Rebuild the snapshot for an object after it's been mutated."""
+        obj = self.get(name)
+        if obj is not None:
+            self._refresh_snapshot(obj)
 
     # ------------------------------------------------------------------
     # Path-based loaders (the canonical entry points)
@@ -191,26 +211,63 @@ class Workspace:
         obj_name = self._unique_name(base, self.documents)
         doc_obj  = load_docx(file_path, name=obj_name)
         self.register_document(doc_obj)
-
-        if extract_tables and getattr(doc_obj, "_pending_tables", None):
-            for idx, (tbl_df, heading) in enumerate(doc_obj._pending_tables):
-                tbl_name = self._unique_name(
-                    f"{obj_name}__table_{idx+1}", self.tables
-                )
-                tbl = TableObject(
-                    name=tbl_name,
-                    df=tbl_df,
-                    source_kind="document",
-                    source_object=obj_name,
-                    source_locator=f"table_index:{idx}",
-                    nearby_heading=heading or "",
-                )
-                self.register_table(tbl)
-                doc_obj.table_names.append(tbl_name)
-            # Strip the temporary attribute now that registration is done
-            del doc_obj._pending_tables
-
+        self._consume_pending_tables(doc_obj, source_kind="document",
+                                     extract_tables=extract_tables)
         return doc_obj
+
+    def register_ocr_from_path(
+        self,
+        file_path: str,
+        *,
+        name: str | None = None,
+        extract_tables: bool = True,
+        **ocr_kwargs,
+    ) -> DocumentObject:
+        """
+        Run OCR on an image or scanned PDF and register the resulting
+        DocumentObject (plus any reconstructed tables) in the workspace.
+
+        Extra kwargs (language, dpi, psm, etc.) are forwarded to
+        `loaders.ocr.load_ocr`.
+        """
+        from loaders.ocr import load_ocr  # noqa: PLC0415
+
+        base     = name or Path(file_path).stem
+        obj_name = self._unique_name(base, self.documents)
+        doc_obj  = load_ocr(file_path, name=obj_name, **ocr_kwargs)
+        self.register_document(doc_obj)
+        self._consume_pending_tables(doc_obj, source_kind="document",
+                                     extract_tables=extract_tables)
+        return doc_obj
+
+    def _consume_pending_tables(
+        self,
+        doc_obj: DocumentObject,
+        *,
+        source_kind: str,
+        extract_tables: bool,
+    ) -> None:
+        """Shared helper: promote DocumentObject._pending_tables → TableObjects."""
+        pending = getattr(doc_obj, "_pending_tables", None)
+        if not extract_tables or not pending:
+            if pending is not None:
+                del doc_obj._pending_tables
+            return
+        for idx, (tbl_df, heading) in enumerate(pending):
+            tbl_name = self._unique_name(
+                f"{doc_obj.name}__table_{idx+1}", self.tables
+            )
+            tbl = TableObject(
+                name=tbl_name,
+                df=tbl_df,
+                source_kind=source_kind,
+                source_object=doc_obj.name,
+                source_locator=f"table_index:{idx}",
+                nearby_heading=heading or "",
+            )
+            self.register_table(tbl)
+            doc_obj.table_names.append(tbl_name)
+        del doc_obj._pending_tables
 
     def register_dataframe_as_table(
         self,
@@ -284,6 +341,7 @@ class Workspace:
             "spreadsheets": [s.to_metadata_dict() for s in self.spreadsheets.values()],
             "documents":    [d.to_metadata_dict() for d in self.documents.values()],
             "tables":       [t.to_metadata_dict() for t in self.tables.values()],
+            "artifacts":    {k: str(v) for k, v in self.artifacts.items()},
             "active":       {
                 "spreadsheet": self.active_spreadsheet.name if self.active_spreadsheet else None,
                 "document":    self.active_document.name    if self.active_document    else None,

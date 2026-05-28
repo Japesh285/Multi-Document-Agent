@@ -4,7 +4,7 @@ import { create } from "zustand";
 import type {
   AgentOutput, BackendInfo, ChartRecord, ChatMessage, HealthInfo,
   Mode, MutationRecord, OllamaStatus, RecentFile, ReportRecord,
-  SessionRecord, SessionSchema, StepResult,
+  SessionRecord, SessionSchema, StepResult, WorkspaceInventory,
 } from "./types";
 import * as api from "./lib/api";
 import * as tauri from "./lib/tauri";
@@ -25,6 +25,9 @@ interface AppState {
   activeSessionId: string | null;
   activeSchema:   SessionSchema | null;
   recentFiles:    RecentFile[];
+
+  // workspace — multi-object inventory
+  workspace:      WorkspaceInventory | null;
 
   // chat
   messages:       ChatMessage[];
@@ -56,6 +59,11 @@ interface AppState {
   closeSession:       () => void;
   uploadAndOpen:      (file: File) => Promise<void>;
   openFromPath:       (path: string) => Promise<void>;
+  // — Workspace —
+  refreshWorkspace:   () => Promise<void>;
+  addFileToWorkspace: (file: File) => Promise<void>;
+  activateObject:     (name: string) => Promise<void>;
+  removeObject:       (name: string) => Promise<void>;
   deleteSession:      (id: string) => Promise<void>;
   renameSession:      (id: string, name: string) => Promise<void>;
   sendQuery:          (text: string) => Promise<void>;
@@ -86,6 +94,8 @@ export const useStore = create<AppState>((set, get) => ({
   activeSessionId: null,
   activeSchema:   null,
   recentFiles:    [],
+
+  workspace:      null,
 
   messages:       [],
   sending:        false,
@@ -185,10 +195,11 @@ export const useStore = create<AppState>((set, get) => ({
       lastSteps:       [],
     });
     await get().refreshSessions();
+    await get().refreshWorkspace();
   },
 
   closeSession: () => set({
-    activeSessionId: null, activeSchema: null,
+    activeSessionId: null, activeSchema: null, workspace: null,
     messages: [], charts: [], mutations: [], reports: [], lastSteps: [],
   }),
 
@@ -202,6 +213,30 @@ export const useStore = create<AppState>((set, get) => ({
     const res = await api.createSessionFromPath(path);
     await get().refreshSessions();
     await get().openSession(res.session.id);
+  },
+
+  refreshWorkspace: async () => {
+    try { set({ workspace: await api.getWorkspace() }); } catch { /* ignore */ }
+  },
+
+  addFileToWorkspace: async (file) => {
+    if (!get().activeSessionId) {
+      // No session yet → fall back to upload-and-open, which creates one.
+      await get().uploadAndOpen(file);
+      return;
+    }
+    const { workspace } = await api.addToWorkspace(file);
+    set({ workspace });
+  },
+
+  activateObject: async (name) => {
+    const res = await api.activateWorkspaceObject(name);
+    set({ workspace: res.workspace });
+  },
+
+  removeObject: async (name) => {
+    const res = await api.removeWorkspaceObject(name);
+    set({ workspace: res.workspace });
   },
 
   deleteSession: async (id) => {
@@ -270,8 +305,10 @@ export const useStore = create<AppState>((set, get) => ({
       };
     });
 
-    // Refresh secondary data
+    // Refresh secondary data — workspace can change after mutations,
+    // table extractions, or new derived objects.
     void get().refreshSessions();
+    void get().refreshWorkspace();
     if (sid) {
       try {
         const [c, mu, r] = await Promise.all([

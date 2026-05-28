@@ -32,6 +32,104 @@ INTENTS = [
     "chart_generation",
 ]
 
+
+# ---------------------------------------------------------------------------
+# Deterministic regex router (Fix #5)
+# ---------------------------------------------------------------------------
+#
+# Catches the common cases before any keyword scoring / LLM call. Returns
+# None for "I don't know — fall through to keyword scoring". The point is
+# to FIX the brittle case where "what sports are in the excel" was being
+# routed to excel_modification.
+
+_VERIFY_RE = re.compile(
+    r"^\s*(verify|validate|confirm|check\s+(?:online|the\s+web|live))\b",
+    re.I,
+)
+_DATE_VERIFY_TIGHT = re.compile(
+    r"\b(?:verify|validate|confirm)\s+(?:the\s+)?(?:dates?|schedule|fixtures?|results?)\b",
+    re.I,
+)
+_REPORT_RE = re.compile(
+    r"^\s*(?:"
+    # "create/generate [a|the] [full|detailed|comprehensive|deep] report/analysis/summary/…"
+    r"(?:generate|create|build|produce|write)\s+(?:a\s+|the\s+)?"
+    r"(?:(?:full|detailed|comprehensive|deep|professional|executive)\s+)?"
+    r"(?:report|summary|analysis|breakdown|brief)"
+    # bare adjective+noun form ("a detailed report")
+    r"|(?:full|detailed|comprehensive|deep)\s+(?:report|analysis|breakdown)"
+    # analyse <scope>
+    r"|analy[sz]e\s+(?:this|all|the\s+whole|everything|the\s+entire)"
+    r")\b",
+    re.I,
+)
+_WRITE_RE = re.compile(
+    r"^\s*(?:"
+    # add/append/create [a] [new] column
+    r"add\s+(?:a\s+)?(?:new\s+)?column\b"
+    r"|append\s+(?:a\s+)?column\b"
+    r"|create\s+(?:a\s+)?column\b"
+    # update [the] [<name>] column / field / value
+    r"|update\s+(?:the\s+)?(?:\w+\s+)?(?:column|field|value)\b"
+    # replace X with Y
+    r"|replace\s+\w+"
+    # set the X to Y
+    r"|set\s+(?:the\s+)?\w+\s+to\s+"
+    # change the X
+    r"|change\s+(?:the\s+)?\w+"
+    # delete the first/last/all rows / columns / a specific entity
+    r"|delete\s+(?:the\s+)?(?:first|last|all)?\s*(?:rows?|columns?|entries|paragraphs?|values?)\b"
+    r"|delete\s+(?:the\s+)?\w+"
+    # remove rows / columns / paragraphs
+    r"|remove\s+(?:the\s+)?(?:rows?|columns?|paragraphs?)\b"
+    # insert a row / column / paragraph
+    r"|insert\s+(?:a\s+)?(?:row|column|paragraph)\b"
+    # mark / flag rows
+    r"|mark\s+(?:every|all|rows?)\b"
+    r"|flag\s+\w+"
+    # explicit save commands
+    r"|save\s+(?:to|as)\s+"
+    r"|write\s+back\b"
+    r")",
+    re.I,
+)
+_CHART_RE = re.compile(
+    r"^\s*(?:"
+    r"chart|plot|graph|visuali[sz]e|bar\s+chart|pie\s+chart|line\s+chart|histogram"
+    r")\b",
+    re.I,
+)
+# READ verbs that should NEVER be misrouted to a mutation flow
+_READ_RE = re.compile(
+    r"^\s*(?:"
+    r"show|list|find|count|how\s+many|how\s+much|which|what(?:\s+(?:is|are|was|were))?"
+    r"|get|fetch|retrieve|tell\s+me|describe|summari[sz]e\s+(?:in\s+)?one"
+    r"|filter|sort\s+by|group\s+by|top\s+\d|bottom\s+\d|highest|lowest"
+    r"|average|mean|median|sum\s+(?:of\s+)?\S"
+    r"|when|where|who"
+    r")\b",
+    re.I,
+)
+
+
+def _regex_route(query: str) -> str | None:
+    """
+    Cheap deterministic router. Returns an intent string or None if no
+    rule fires. Order matters: VERIFY beats READ ("verify the totals"
+    must not route to data_query).
+    """
+    if _VERIFY_RE.search(query) or _DATE_VERIFY_TIGHT.search(query):
+        return "internet_research"
+    if _REPORT_RE.search(query):
+        return "report_generation"
+    if _CHART_RE.search(query):
+        return "chart_generation"
+    if _READ_RE.search(query):
+        return "data_query"
+    if _WRITE_RE.search(query):
+        return "excel_modification"
+    return None
+
 # Keyword → intent scoring weights
 _KEYWORD_MAP: dict[str, list[str]] = {
     "report_generation": [
@@ -233,35 +331,45 @@ def is_date_verification(query: str) -> bool:
 
 def detect_intent(query: str, schema=None) -> IntentResult:
     """
-    Detect user intent from the natural-language query.
-
-    Logs:
-      - keyword scores
-      - chosen intent + method used
-      - confidence
+    Detect user intent. Priority:
+      1. Deterministic regex (covers ~90% of real queries cheaply)
+      2. Keyword scoring (back-compat for queries the regex misses)
+      3. LLM fallback (only when keyword scoring is ambiguous)
     """
     scores = _keyword_scores(query)
     log.debug("router: keyword scores=%s", {k: round(v, 1) for k, v in scores.items() if v > 0})
 
+    # 1. Regex first — deterministic, ~10µs
+    regex_intent = _regex_route(query)
+    if regex_intent is not None:
+        flags = _needs_flags(query, scores)
+        result = IntentResult(
+            intent=regex_intent,
+            confidence=0.95,
+            method="regex",
+            **flags,
+        )
+        log.debug("router: regex → %s", regex_intent)
+        return result
+
+    # 2. Keyword scoring (existing path)
     intent, confidence, method = _keyword_classify(query)
 
+    # 3. LLM fallback only when truly ambiguous
     if confidence < _KEYWORD_CONFIDENCE_THRESHOLD:
         log.debug("router: low keyword confidence (%.2f) → calling LLM", confidence)
         intent, confidence = _llm_classify(query)
         method = "llm"
 
     flags = _needs_flags(query, scores)
-
     result = IntentResult(
         intent=intent,
         confidence=round(confidence, 2),
         method=method,
         **flags,
     )
-
     log.debug(
-        "router: intent=%s  conf=%.0f%%  method=%s  web=%s  write=%s  charts=%s",
+        "router: intent=%s  conf=%.0f%%  method=%s",
         result.intent, result.confidence * 100, result.method,
-        result.needs_web_search, result.needs_excel_write, result.needs_charts,
     )
     return result

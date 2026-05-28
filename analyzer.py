@@ -1,18 +1,27 @@
 """
-analyzer.py — Per-step code generation and execution against the workspace.
+analyzer.py — single-LLM-call workspace-aware step execution.
 
-Each step gets its own LLM call with:
-  - compiled workspace context (compact summary; never raw data)
-  - prior-step memory
-  - the specific step description
+Architecture:
 
-Handles retries internally (up to MAX_RETRIES) without surfacing each
-attempt to the orchestration layer.
+    USER QUERY
+       ↓
+    build_workspace_system_prompt(workspace)   ← static snapshots in
+       ↓                                         the system prompt
+    llm.call_chat()                            ← one call
+       ↓
+    executor.safe_execute(code, workspace=ws)  ← sandbox
+       ↓
+    StepResult(output=str(result))             ← `result` is already
+                                                 a human-readable string
+
+On Python execution errors only, we retry up to MAX_RETRIES with the
+error appended. No probe phase, no verifier, no formatter — qwen-coder
+writes a formatted answer directly into `result` per the system prompt.
 """
 
 from __future__ import annotations
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import pandas as pd
 
@@ -28,21 +37,23 @@ if TYPE_CHECKING:
 
 log = get_logger("analyzer")
 
-MAX_RETRIES = 3
+MAX_RETRIES = 2     # one initial + one retry on Python error
 
 
 # ---------------------------------------------------------------------------
-# Step prompt
+# Per-step user message
 # ---------------------------------------------------------------------------
+
 
 _STEP_USER = """\
-{prior_steps_block}
+{prior_steps_block}{targets_hint}
 
-CURRENT STEP
-{description}{targets_hint}
+USER REQUEST
+"{description}"
 
-Write Python that computes this step against the workspace.
-Store your answer in  result\
+Write Python that fulfils this request against the workspace objects.
+Assign a HUMAN-READABLE STRING to `result` in the format the request
+implies. Return ONLY raw Python code.\
 """
 
 
@@ -50,7 +61,7 @@ def _targets_hint(step: dict) -> str:
     targets = step.get("targets") or []
     if not targets:
         return ""
-    return f"\nPrimary target object(s): {', '.join(targets)}"
+    return f"\nPrimary target object(s): {', '.join(targets)}\n"
 
 
 def _build_step_messages(
@@ -59,14 +70,15 @@ def _build_step_messages(
     memory: AnalysisMemory,
     query: str,
 ) -> list[dict]:
-    system_content = build_workspace_system_prompt(workspace, query=query)
-    user_content   = _STEP_USER.format(
-        prior_steps_block=memory.step_context_for_prompt(),
-        description=step["description"],
+    prior = memory.step_context_for_prompt() if memory.results else ""
+    prior_block = (f"PRIOR STEPS\n{prior}\n" if prior else "")
+    user_content = _STEP_USER.format(
+        prior_steps_block=prior_block,
         targets_hint=_targets_hint(step),
+        description=step["description"],
     )
     return [
-        {"role": "system", "content": system_content},
+        {"role": "system", "content": build_workspace_system_prompt(workspace, query=query)},
         {"role": "user",   "content": user_content},
     ]
 
@@ -81,16 +93,15 @@ def _build_retry_messages(
 ) -> list[dict]:
     base = _build_step_messages(step, workspace, memory, query)
     base.append({"role": "assistant", "content": f"```python\n{broken_code}\n```"})
-    base.append({
-        "role":    "user",
-        "content": build_workspace_retry_message(error, broken_code, workspace),
-    })
+    base.append({"role": "user",
+                 "content": build_workspace_retry_message(error, broken_code, workspace)})
     return base
 
 
 # ---------------------------------------------------------------------------
-# Charting
+# Charting (re-runs the code to capture the raw object for plotting)
 # ---------------------------------------------------------------------------
+
 
 def _chart_from_workspace(
     code: str,
@@ -98,10 +109,6 @@ def _chart_from_workspace(
     step_id: str,
     description: str,
 ) -> str | None:
-    """
-    Re-run the step code via execute_for_result to capture the raw `result`
-    object, then hand it to auto_chart. Silent on any failure.
-    """
     try:
         raw = execute_for_result(code, workspace=workspace)
     except Exception:
@@ -118,6 +125,7 @@ def _chart_from_workspace(
 # Public API
 # ---------------------------------------------------------------------------
 
+
 def run_step(
     step:      dict,
     workspace: "Workspace",
@@ -127,8 +135,8 @@ def run_step(
     stream:    bool = False,
 ) -> StepResult:
     """
-    Generate and execute code for one workspace-aware step.
-    Retries up to MAX_RETRIES on execution errors.
+    Single LLM call per step. Retries up to MAX_RETRIES only on Python
+    execution errors.
     """
     step_id     = step["id"]
     description = step["description"]
@@ -137,7 +145,6 @@ def run_step(
     code:    str = ""
     error:   str | None = None
     output:  str = ""
-    messages: list[dict] = []
 
     t_total = time.perf_counter()
 
@@ -146,10 +153,9 @@ def run_step(
             messages = _build_step_messages(step, workspace, memory, query)
             prefix   = f"  [{step_id}] "
         else:
-            log.debug("analyzer: retry %d/%d for %s — %s",
-                      attempt, MAX_RETRIES, step_id, error)
+            log.debug("analyzer: retry %d/%d  err=%s", attempt, MAX_RETRIES, error)
             if stream:
-                print(f"\n  Retry {attempt - 1}/{MAX_RETRIES - 1} → fixing: {str(error)[:80]}")
+                print(f"\n  retry {attempt - 1}/{MAX_RETRIES - 1} → fixing: {str(error)[:80]}")
             messages = _build_retry_messages(step, workspace, memory, query, code, error or "")
             prefix   = f"  [{step_id}] retry {attempt - 1} "
 
@@ -161,25 +167,20 @@ def run_step(
         if stream:
             print()
 
-        log.debug("analyzer: attempt %d code:\n%s", attempt, code[:300])
         output, error, _exec_elapsed = safe_execute(code, workspace=workspace)
         if error is None:
             break
 
     total_elapsed = time.perf_counter() - t_total
+
     chart_path: str | None = None
     if error is None:
         chart_path = _chart_from_workspace(code, workspace, step_id, description)
 
     result = StepResult(
-        step_id=step_id,
-        description=description,
-        code=code,
-        output=output,
-        error=error,
-        elapsed=total_elapsed,
-        chart_path=chart_path,
+        step_id=step_id, description=description, code=code,
+        output=output, error=error, elapsed=total_elapsed, chart_path=chart_path,
     )
-    status = "OK" if result.ok else "FAILED"
-    log.debug("analyzer: %s %s  %.1fs", step_id, status, total_elapsed)
+    log.debug("analyzer: %s %s  %.1fs",
+              step_id, "OK" if result.ok else "FAILED", total_elapsed)
     return result

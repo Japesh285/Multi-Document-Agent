@@ -47,9 +47,12 @@ log = get_logger("executor")
 # so strings like "no exec/eval allowed" don't trigger false positives.
 # ---------------------------------------------------------------------------
 
+# Dangerous patterns that are HARD-blocked (these are still a deal-breaker).
+# Note: NO bare-import rule here — imports of pre-loaded modules
+# (pandas/numpy/etc.) are stripped by `_sanitize_code`, and imports of
+# anything else are caught by the dunder + os/sys/subprocess checks below.
 _BLOCKED = re.compile(
-    r"\bimport\s+\w"            # import statement
-    r"|\b__import__\s*\("       # __import__() dynamic import
+    r"\b__import__\s*\("        # __import__() dynamic import
     r"|\bopen\s*\("             # file open
     r"|\bexec\s*\("             # exec() call
     r"|\beval\s*\("             # eval() call
@@ -58,12 +61,57 @@ _BLOCKED = re.compile(
     r"|os\.\w"                  # os module access
     r"|sys\.\w"                 # sys module access
     r"|\bsubprocess\b"
-    r"|\bshutil\b"
     r"|\bsocket\b"
-    r"|\bpathlib\b"
-    r"|\bbuiltins\b"
     r"|\b__\w+__\s*\("          # dunder calls like __class__()
 )
+
+# Imports of modules that are already pre-loaded in the sandbox.
+# These get silently stripped instead of failing the whole call.
+_SAFE_IMPORTS = re.compile(
+    r"^\s*(?:"
+    r"from\s+(?:pandas|numpy|openpyxl|datetime|re|json|math|statistics|collections|itertools)"
+    r"(?:\.\w+)*\s+import\s+[\w,\s\*]+"
+    r"|import\s+(?:pandas|numpy|openpyxl|datetime|re|json|math|statistics|collections|itertools)"
+    r"(?:\s+as\s+\w+)?"
+    r")\s*$",
+    re.MULTILINE,
+)
+
+# Disallowed but recoverable imports (anything not in the safe list).
+# If we see `import requests` etc., we strip it AND remember that we did,
+# so the error message tells the model to use workspace tools instead.
+_OTHER_IMPORTS = re.compile(
+    r"^\s*(?:from\s+\w+(?:\.\w+)*\s+import\s+[\w,\s\*]+"
+    r"|import\s+\w+(?:\s+as\s+\w+)?)\s*$",
+    re.MULTILINE,
+)
+
+
+def _sanitize_code(code: str) -> tuple[str, list[str]]:
+    """
+    Strip cooperative-with-LLM imports before running. The model often
+    writes `import pandas as pd` even though it's pre-loaded — that should
+    be silently removed, not cause the whole query to fail.
+
+    Returns (cleaned_code, list_of_warnings). Warnings are informational only.
+    """
+    warnings: list[str] = []
+    n_safe = len(_SAFE_IMPORTS.findall(code))
+    if n_safe:
+        code = _SAFE_IMPORTS.sub("", code)
+        warnings.append(f"Stripped {n_safe} import(s) of pre-loaded modules")
+
+    # Any remaining import line is non-standard — strip it but warn.
+    # The model's code might break if it relied on that import; that
+    # surfaces as a NameError which triggers the normal retry loop.
+    remaining = _OTHER_IMPORTS.findall(code)
+    if remaining:
+        code = _OTHER_IMPORTS.sub("", code)
+        warnings.append(f"Stripped {len(remaining)} non-standard import(s)")
+
+    # Tidy up: collapse 3+ blank lines that import stripping may have left
+    code = re.sub(r"\n{3,}", "\n\n", code).strip()
+    return code, warnings
 
 _SAFE_BUILTINS: dict[str, Any] = {
     "abs": abs, "all": all, "any": any, "bool": bool, "dict": dict,
@@ -83,10 +131,19 @@ def _build_sandbox(
     workspace: "Workspace | None",
 ) -> dict[str, Any]:
     """Compose the variables visible to executing code."""
+    # Common-use modules made available WITHOUT requiring an import.
+    # If the model writes `re.search(...)`, it just works.
+    import datetime as _dt    # noqa: PLC0415
+    import re as _re_mod      # noqa: PLC0415
+    import json as _json_mod  # noqa: PLC0415
+
     sandbox: dict[str, Any] = {
         "__builtins__": _SAFE_BUILTINS,
-        "pd": pd,
-        "np": np,
+        "pd":       pd,
+        "np":       np,
+        "re":       _re_mod,
+        "json":     _json_mod,
+        "datetime": _dt,
     }
 
     # Legacy / convenience: bare df
@@ -106,11 +163,26 @@ def _build_sandbox(
         active_doc = workspace.active_document
         if active_doc is not None:
             sandbox["doc"] = active_doc
+            # OCR convenience shortcuts — only useful when the active doc has OCR
+            if getattr(active_doc, "is_ocr", False):
+                sandbox["ocr_pages"]    = active_doc.ocr_pages
+                sandbox["ocr_lines"]    = active_doc.ocr_lines
+                sandbox["ocr_blocks"]   = active_doc.ocr_blocks
+                sandbox["ocr_words"]    = active_doc.ocr_words
+                sandbox["ocr_tables"]   = active_doc.ocr_tables
+                sandbox["ocr_metadata"] = active_doc.ocr_metadata
         # Helper: stash a derived dataframe back in the workspace
         def _register_table(_df: pd.DataFrame, name: str, **kwargs) -> str:
             obj = workspace.register_dataframe_as_table(_df, name=name, **kwargs)
             return obj.name
         sandbox["register_table"] = _register_table
+        # Helper: stash a structured artifact for cross-query use (Fix #3)
+        def _set_artifact(name: str, value: Any) -> str:
+            workspace.artifacts[name] = value
+            workspace.metadata["last_artifact_name"] = name
+            return name
+        sandbox["set_artifact"]   = _set_artifact
+        sandbox["artifacts"]      = workspace.artifacts  # readable in code too
 
     return sandbox
 
@@ -124,9 +196,12 @@ def safe_execute(
     """
     Execute LLM-generated Python in a restricted sandbox.
 
-    Pass either `df` (legacy single-DataFrame mode) or `workspace`
-    (universal workspace mode). Passing both is allowed — `df` takes
-    precedence as the value of the `df` variable.
+    Cooperative pre-processing:
+      1. Strips imports of pre-loaded modules (pandas/numpy/etc.) so the
+         model doesn't get punished for habitual `import pandas as pd`.
+      2. Hard-blocks dangerous patterns only (open/exec/eval/subprocess/dunders).
+      3. Captures both `result` (string) and `artifact` (structured) into the
+         workspace for cross-query persistence.
 
     Returns:
         (output_string, error_string_or_None, elapsed_seconds)
@@ -134,6 +209,12 @@ def safe_execute(
     if df is None and workspace is None:
         raise ValueError("safe_execute: pass either df= or workspace=")
 
+    # 1. Sanitize — strip harmless imports and tidy whitespace
+    code, sanitize_warnings = _sanitize_code(code)
+    if sanitize_warnings:
+        log.debug("executor: sanitize: %s", "; ".join(sanitize_warnings))
+
+    # 2. Hard-block only dangerous patterns
     m = _BLOCKED.search(code)
     if m:
         msg = f"Blocked pattern in generated code: '{m.group()}'"
@@ -163,6 +244,18 @@ def safe_execute(
     captured = buf.getvalue().strip()
     result   = local_vars.get("result")
 
+    # 3. Persist any structured artifact (Fix #3).
+    #    Both forms are accepted: `artifact = {...}` or `set_artifact(name, ...)`.
+    if workspace is not None:
+        art = local_vars.get("artifact")
+        if art is not None:
+            # Name the artifact by the most-recent-query stem if not explicit
+            name = "last_result"
+            workspace.artifacts[name] = art
+            workspace.metadata["last_artifact_name"] = name
+            log.debug("executor: captured artifact[%r] type=%s",
+                      name, type(art).__name__)
+
     return format_result(result, captured), None, elapsed
 
 
@@ -179,8 +272,8 @@ def execute_for_result(
     further programmatic use (e.g. excel_writer.execute_column_mutation).
     Returns None on error or if `result` was not set.
     """
-    m = _BLOCKED.search(code)
-    if m:
+    code, _warns = _sanitize_code(code)
+    if _BLOCKED.search(code):
         return None
     sandbox = _build_sandbox(df=df, workspace=workspace)
     local_vars: dict = {}

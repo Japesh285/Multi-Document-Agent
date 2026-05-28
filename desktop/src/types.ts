@@ -5,6 +5,15 @@ export interface SchemaShape {
   columns: number;
 }
 
+export interface SheetInfo {
+  name: string;
+  rows: number;
+  columns: number;
+  column_names?: string[];
+  is_primary?: boolean;
+  is_empty?: boolean;
+}
+
 export interface SessionSchema {
   file_path: string;
   shape: SchemaShape;
@@ -16,6 +25,68 @@ export interface SessionSchema {
   unique_results: string[];
   domain: string;
   domain_confidence: number;
+  // — Ingestion metadata (spreadsheets) —
+  file_type?: string;                          // "xlsx" | "xls" | "xlsm" | "csv" | "tsv" | "docx" | "pdf" | "png" | …
+  sheets?: SheetInfo[];
+  active_sheet?: string;
+  encoding?: string | null;
+  delimiter?: string | null;
+  workbook_metadata?: Record<string, unknown>;
+  ingestion_warnings?: string[];
+  // — OCR metadata (PDFs/images) —
+  source_kind?: string;                        // "pdf_text" | "pdf_scanned" | "image"
+  page_count?: number;
+  table_count?: number;
+  ocr_confidence?: number;
+  warnings?: string[];
+}
+
+// ── Workspace inventory ───────────────────────────────────────────────────
+
+export type WorkspaceObjectKind = "spreadsheet" | "document" | "table";
+
+export interface WorkspaceObjectMeta {
+  name: string;
+  kind: WorkspaceObjectKind;
+  source_path?: string;
+  created_at?: string;
+  summary: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface WorkspaceMemorySnapshot {
+  active_objects: string[];
+  results: Array<{
+    timestamp: string;
+    query: string;
+    intent?: string;
+    result_kind: string;
+    summary: string;
+    dataframe_shape?: [number, number];
+    dataframe_columns?: string[];
+  }>;
+  mutations: Array<{
+    timestamp: string;
+    object_name: string;
+    object_kind: string;
+    action: string;
+    detail?: string;
+    success: boolean;
+    error?: string;
+  }>;
+  query_history: Array<{ timestamp: string; query: string }>;
+}
+
+export interface WorkspaceInventory {
+  spreadsheets: WorkspaceObjectMeta[];
+  documents:    WorkspaceObjectMeta[];
+  tables:       WorkspaceObjectMeta[];
+  active: {
+    spreadsheet: string | null;
+    document:    string | null;
+    most_recent: string;
+  };
+  memory: WorkspaceMemorySnapshot;
 }
 
 export interface SessionRecord {
@@ -80,6 +151,7 @@ export interface AgentOutput {
   success: boolean;
   error: string | null;
   report_id?: string;
+  workspace_snapshot?: WorkspaceInventory;
 }
 
 export interface ChatMessage {
@@ -144,7 +216,9 @@ export interface HealthInfo {
   version: string;
   ollama: { reachable: boolean; error?: string };
   session: string | null;
-  df_loaded: boolean;
+  // Newer backends report a workspace summary; older ones may still return df_loaded.
+  workspace?: { spreadsheets: number; documents: number; tables: number };
+  df_loaded?: boolean;
 }
 
 export interface OllamaStatus {

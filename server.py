@@ -59,11 +59,14 @@ import app as agent_app
 import sessions
 from loaders import SUPPORTED_EXTENSIONS, LoaderError, load_any
 from loaders.docx import DocumentLoadError, load_docx
+from loaders.ocr import (
+    SUPPORTED_OCR_EXTENSIONS, OcrUnavailableError, is_ocr_supported, load_ocr,
+)
 from schema import build_schema, SchemaInfo
 from utils import get_logger
 
-# Workspace extensions = spreadsheet extensions + .docx
-WORKSPACE_EXTENSIONS = SUPPORTED_EXTENSIONS | {".docx"}
+# Workspace extensions = spreadsheet extensions + .docx + OCR (PDFs/images)
+WORKSPACE_EXTENSIONS = SUPPORTED_EXTENSIONS | {".docx"} | SUPPORTED_OCR_EXTENSIONS
 
 log = get_logger("server")
 
@@ -82,6 +85,12 @@ for d in (UPLOAD_DIR, REPORTS_DIR, CHARTS_DIR):
 async def _lifespan(app: FastAPI):
     log.info("server: starting up")
     sessions.init_db()
+    # Pre-load the Ollama model so the first user query doesn't hit cold start
+    try:
+        import llm  # noqa: PLC0415
+        await asyncio.to_thread(llm.warm_up)
+    except Exception as exc:
+        log.warning("server: warm_up failed (continuing) — %s", exc)
     yield
     log.info("server: shutting down")
 
@@ -151,9 +160,11 @@ def _activate_session(
         suffix = file_path.suffix.lower()
         if suffix == ".docx":
             ws.register_document_from_path(str(file_path))
+        elif is_ocr_supported(str(file_path)):
+            ws.register_ocr_from_path(str(file_path))
         else:
             ws.register_spreadsheet_from_path(str(file_path), sheet=sheet)
-    except (LoaderError, DocumentLoadError) as exc:
+    except (LoaderError, DocumentLoadError, OcrUnavailableError) as exc:
         raise HTTPException(400, f"Failed to load file: {exc}")
 
     _active_session_id = session_id
@@ -473,6 +484,32 @@ async def upload(file: UploadFile = File(...)):
                 "tables":     len(doc_obj.table_names),
                 "sections":   [s["name"] for s in doc_obj.sections],
             }
+        elif is_ocr_supported(str(dest)):
+            doc_obj = load_ocr(str(dest))
+            ocr_meta = doc_obj.metadata.get("ocr", {})
+            schema_dict = {
+                "file_path":         str(dest),
+                "file_type":         suffix.lstrip("."),
+                "source_kind":       ocr_meta.get("source_kind", "ocr"),
+                "shape":             {"rows": len(doc_obj.paragraphs), "columns": 0},
+                "columns":           [],
+                "domain":            "ocr_document",
+                "domain_confidence": 1.0,
+                "ocr_confidence":    doc_obj.metadata.get("ocr_confidence", 0.0),
+                "page_count":        ocr_meta.get("page_count", 0),
+                "table_count":       ocr_meta.get("table_count", 0),
+                "warnings":          ocr_meta.get("warnings", []),
+            }
+            rows, cols = len(doc_obj.paragraphs), 0
+            domain, dconf = "ocr_document", 1.0
+            metadata_payload = {
+                "file_type":       suffix.lstrip("."),
+                "source_kind":     ocr_meta.get("source_kind", "ocr"),
+                "page_count":      ocr_meta.get("page_count", 0),
+                "table_count":     ocr_meta.get("table_count", 0),
+                "ocr_confidence":  doc_obj.metadata.get("ocr_confidence", 0.0),
+                "warnings":        ocr_meta.get("warnings", []),
+            }
         else:
             loaded = load_any(str(dest))
             schema = build_schema(loaded.df, str(dest), loaded=loaded)
@@ -480,7 +517,7 @@ async def upload(file: UploadFile = File(...)):
             rows, cols = schema.shape
             domain, dconf = schema.domain, schema.domain_confidence
             metadata_payload = loaded.to_metadata_dict()
-    except (LoaderError, DocumentLoadError) as exc:
+    except (LoaderError, DocumentLoadError, OcrUnavailableError) as exc:
         log.warning("server: load failed for %s — %s", dest.name, exc)
         raise HTTPException(400, f"Failed to parse file: {exc}")
     except Exception as exc:
@@ -542,12 +579,15 @@ async def workspace_add(file: UploadFile = File(...)):
     ws = agent_app.get_workspace()
     try:
         if suffix == ".docx":
-            obj = ws.register_document_from_path(str(dest))
+            obj  = ws.register_document_from_path(str(dest))
+            kind = "document"
+        elif is_ocr_supported(str(dest)):
+            obj  = ws.register_ocr_from_path(str(dest))
             kind = "document"
         else:
-            obj = ws.register_spreadsheet_from_path(str(dest))
+            obj  = ws.register_spreadsheet_from_path(str(dest))
             kind = "spreadsheet"
-    except (LoaderError, DocumentLoadError) as exc:
+    except (LoaderError, DocumentLoadError, OcrUnavailableError) as exc:
         raise HTTPException(400, f"Failed to parse {dest.name}: {exc}")
 
     log.info("server: workspace.add %s:%s", kind, obj.name)

@@ -1,8 +1,27 @@
 import { useState } from "react";
-import { Upload, FileSpreadsheet, FilePlus2 } from "lucide-react";
+import {
+  Upload, FileSpreadsheet, FilePlus2, FileText, FileImage, FileSearch,
+} from "lucide-react";
 import clsx from "clsx";
 import { useStore } from "../store";
-import { pickXlsxFile } from "../lib/tauri";
+import {
+  pickWorkspaceFile,
+  ALL_WORKSPACE_EXTS, SPREADSHEET_EXTS, DOCUMENT_EXTS, OCR_EXTS,
+} from "../lib/tauri";
+
+const ACCEPT_ATTR = ALL_WORKSPACE_EXTS.map(e => "." + e).join(",");
+
+function extOf(name: string): string {
+  const m = name.toLowerCase().match(/\.([a-z0-9]+)$/);
+  return m ? m[1] : "";
+}
+
+function iconFor(ext: string) {
+  if (SPREADSHEET_EXTS.includes(ext)) return <FileSpreadsheet size={14} className="text-chalk-400" />;
+  if (DOCUMENT_EXTS.includes(ext))    return <FileText        size={14} className="text-chalk-400" />;
+  if (OCR_EXTS.includes(ext))         return <FileImage       size={14} className="text-chalk-400" />;
+  return <FileSearch size={14} className="text-chalk-400" />;
+}
 
 export default function FileDropZone() {
   const { uploadAndOpen, openFromPath, recentFiles } = useStore();
@@ -25,11 +44,11 @@ export default function FileDropZone() {
   }
 
   async function browse() {
-    const path = await pickXlsxFile();
+    const path = await pickWorkspaceFile();
     if (path) { await handlePath(path); return; }
     const input = document.createElement("input");
     input.type = "file";
-    input.accept = ".xlsx,.xlsm,.xls";
+    input.accept = ACCEPT_ATTR;
     input.onchange = async () => {
       const f = input.files?.[0];
       if (f) await handleFile(f);
@@ -59,10 +78,15 @@ export default function FileDropZone() {
           <Upload size={22} className="text-accent-400" />
         </div>
         <div className="text-base font-semibold text-chalk-50 mb-1">
-          Drop an Excel file to begin
+          Drop a file to begin
         </div>
-        <div className="text-[12.5px] text-chalk-400 mb-5">
-          .xlsx, .xlsm and .xls supported · processed entirely on this machine
+        <div className="text-[12.5px] text-chalk-400 mb-3">
+          Spreadsheet · Word · PDF · Image · all processed locally
+        </div>
+        <div className="text-[11px] text-chalk-500 mb-5 flex flex-wrap justify-center gap-1">
+          {ALL_WORKSPACE_EXTS.map(e => (
+            <span key={e} className="chip">.{e}</span>
+          ))}
         </div>
         <button onClick={browse} disabled={busy} className="btn-primary mx-auto">
           <FilePlus2 size={14} />
@@ -79,24 +103,27 @@ export default function FileDropZone() {
             Recent
           </div>
           <div className="space-y-1">
-            {recentFiles.slice(0, 5).map(f => (
-              <button
-                key={f.file_path}
-                onClick={() => void handlePath(f.file_path)}
-                className="w-full pane p-2.5 flex items-center gap-3 hover:border-accent-600/30 text-left transition-colors"
-              >
-                <FileSpreadsheet size={14} className="text-chalk-400" />
-                <div className="flex-1 min-w-0">
-                  <div className="text-[12.5px] font-medium truncate">{f.file_name}</div>
-                  <div className="text-[10.5px] text-chalk-500 truncate">
-                    {f.file_path}
+            {recentFiles.slice(0, 5).map(f => {
+              const ext = extOf(f.file_name);
+              return (
+                <button
+                  key={f.file_path}
+                  onClick={() => void handlePath(f.file_path)}
+                  className="w-full pane p-2.5 flex items-center gap-3 hover:border-accent-600/30 text-left transition-colors"
+                >
+                  {iconFor(ext)}
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[12.5px] font-medium truncate">{f.file_name}</div>
+                    <div className="text-[10.5px] text-chalk-500 truncate">
+                      {f.file_path}
+                    </div>
                   </div>
-                </div>
-                <div className="text-[10.5px] text-chalk-400 whitespace-nowrap">
-                  {new Date(f.last_opened).toLocaleDateString()}
-                </div>
-              </button>
-            ))}
+                  <div className="text-[10.5px] text-chalk-400 whitespace-nowrap">
+                    {new Date(f.last_opened).toLocaleDateString()}
+                  </div>
+                </button>
+              );
+            })}
           </div>
         </div>
       )}

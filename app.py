@@ -337,8 +337,8 @@ def handle_chart(query: str) -> AgentOutput:
     """Focused single step → chart, minimal report wrapper."""
     result = _run_single_step(query, step_id="chart_data")
     charts = [result.chart_path] if result.chart_path else []
-    report = f"## Chart: {query}\n\n"
-    report += result.output if result.ok else f"Error: {result.error}"
+    body = result.output if result.ok else f"Error: {result.error}"
+    report = body
     if charts:
         report += f"\n\nChart saved: {charts[0]}"
     _workspace.memory.record_query(query)
@@ -490,7 +490,7 @@ def handle_excel_modification(query: str) -> AgentOutput:
             object_name=target_ss.name, object_kind="spreadsheet",
             action="add_column",
             detail=f"col={col_name!r} rows={change.rows_affected}",
-            success=True,
+            success=True, workspace=_workspace,
         )
         updates = [change.to_dict()]
     else:
@@ -591,7 +591,7 @@ def handle_document_modification(query: str) -> AgentOutput:
     _workspace.memory.record_mutation(
         object_name=target_doc.name, object_kind="document",
         action="document_mutation", detail=output[:120] if output else "saved",
-        success=True,
+        success=True, workspace=_workspace,
     )
     return AgentOutput(
         query=query,
@@ -680,28 +680,80 @@ def handle_web_search(query: str) -> AgentOutput:
     )
 
 
+def _artifact_to_matchups(artifact: dict) -> list:
+    """
+    Pull verifiable entities from a structured artifact deterministically.
+
+    Recognised artifact shapes:
+      {"type": "nba_matches" | "matches" | "fixtures" | "events" | ...,
+       "items": [{"teams": "A vs B", "date": "YYYY-MM-DD"}, ...]}
+      {"items": [{"selection": "...", "game_date": "..."}, ...]}
+
+    Returns a list of Matchup-shaped entries the verifier can consume.
+    """
+    from entity_extractor import Matchup as _Mu  # noqa: PLC0415
+    if not isinstance(artifact, dict):
+        return []
+    items = artifact.get("items") or []
+    if not isinstance(items, list):
+        return []
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        sel  = str(it.get("selection") or it.get("teams") or it.get("name") or "").strip()
+        date = str(it.get("game_date") or it.get("date") or "").strip()
+        if not sel:
+            continue
+        out.append(_Mu(
+            selection=sel, sport=str(it.get("sport", "")),
+            game_date=date, bet_type="", result="",
+        ))
+    return out
+
+
 def handle_verification(query: str, entities=None) -> AgentOutput:
-    """Date-verification pipeline against the active spreadsheet."""
+    """
+    Verification flow that operates on **structured artifacts**.
+
+    Priority for entity source (no LLM extraction when an artifact exists):
+      1. workspace.artifacts['last_result']  — set by the previous query
+      2. Last DataFrame result + active spreadsheet schema
+      3. LLM-based text extraction (fallback only)
+    """
     schema  = None
     if _workspace.active_spreadsheet:
         schema = _workspace.active_spreadsheet.schema
-    last_df = _workspace.memory.last_dataframe_result
 
-    if entities is None:
+    # 1. Structured artifact path — deterministic, no LLM
+    matchups: list = []
+    artifact = _workspace.artifacts.get("last_result")
+    if artifact is not None:
+        matchups = _artifact_to_matchups(artifact)
+        if matchups:
+            log.info("verify: resolved %d entity(ies) from last_result artifact",
+                     len(matchups))
+            from entity_extractor import EntitySet  # noqa: PLC0415
+            entities = EntitySet(matchups=matchups)
+
+    # 2. DataFrame result fallback
+    if not matchups and entities is None:
+        last_df = _workspace.memory.last_dataframe_result
         if last_df is not None and not last_df.empty and schema is not None:
             entities = extract_entities(last_df, profile=schema.profile)
         else:
             unique_sports = schema.unique_sports if schema else []
             entities = extract_entities_from_text(query, unique_sports)
 
-    if entities.is_empty():
+    if entities is None or entities.is_empty():
         return AgentOutput(
             query=query,
-            report="Could not extract any entities to verify. Run a data query first.",
+            report=("Could not find any entities to verify. Run a query that "
+                    "produces a structured artifact first (e.g. 'list NBA matches')."),
             success=False, error="No entities",
         )
 
-    matchups = entities.matchups
+    matchups = matchups or entities.matchups
     if not matchups:
         from entity_extractor import Matchup as _Mu  # noqa: PLC0415
         dates = entities.dates
@@ -773,7 +825,7 @@ def _write_verification_columns(vresults: list[VerificationResult], target_ss) -
         _workspace.memory.record_mutation(
             object_name=target_ss.name, object_kind="spreadsheet",
             action="add_verification_cols", detail=f"{len(vresults)} entities",
-            success=True,
+            success=True, workspace=_workspace,
         )
         return [{"action": "add_verification_cols", "rows": len(vresults)}]
     return []
@@ -1109,20 +1161,29 @@ def _print_workspace_status(initial_path: str) -> None:
 
 def _load_path_into_workspace(file_path: str, *, name: str | None = None,
                               sheet: str | None = None) -> None:
-    """Dispatch by extension: spreadsheet → register_spreadsheet, .docx → register_document."""
+    """
+    Dispatch by extension:
+        .xlsx/.xls/.xlsm/.csv/.tsv  → register_spreadsheet
+        .docx                       → register_document
+        .pdf / image extensions     → register_ocr (Tesseract via loaders.ocr)
+    """
+    from loaders.ocr import is_ocr_supported, SUPPORTED_OCR_EXTENSIONS  # noqa: PLC0415
+
     p = Path(file_path)
     if not p.exists():
         raise FileNotFoundError(f"File not found: {p}")
     suffix = p.suffix.lower()
     if suffix == ".docx":
         _workspace.register_document_from_path(str(p), name=name)
+    elif is_ocr_supported(str(p)):
+        _workspace.register_ocr_from_path(str(p), name=name)
     elif is_supported(str(p)):
         _workspace.register_spreadsheet_from_path(str(p), name=name, sheet=sheet)
     else:
-        raise ValueError(
-            f"Unsupported file '{suffix}'. "
-            f"Supported: {sorted(SUPPORTED_EXTENSIONS)} + .docx"
+        supported = sorted(
+            set(SUPPORTED_EXTENSIONS) | {".docx"} | set(SUPPORTED_OCR_EXTENSIONS)
         )
+        raise ValueError(f"Unsupported file '{suffix}'. Supported: {supported}")
 
 
 def init_app(file_path: str, sheet: str | None = None) -> None:
